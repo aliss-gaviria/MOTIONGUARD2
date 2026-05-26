@@ -26,7 +26,7 @@
 #define MAX30102_SDA      GPIO_NUM_15
 #define MAX30102_SCL      GPIO_NUM_16
 
-#define WIFI_CHANNEL   1
-
+#define WIFI_CHANNEL   11
+#define ESPNOW_WIFI_SSID "Galaxy S20 FEE8DE"
 #define RECEIVER_MAC {0x2C,0xBC,0xBB,0x06,0xB5,0x3C}
 #endif
