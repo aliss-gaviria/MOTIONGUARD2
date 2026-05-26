@@ -1,0 +1,312 @@
+/**
+ * @file oled.c
+ * @brief Driver minimalista para OLED SSD1306 128x64 por I2C.
+ *
+ * Implementa renderizado de texto sin librerías externas, usando
+ * una fuente 5x7 embebida. Comparte el bus I2C_NUM_0 con el MPU6050.
+ */
+
+#include "oled.h"
+#include "config.h"
+
+#include <string.h>
+#include <stdio.h>
+#include "driver/i2c.h"
+#include "esp_log.h"
+
+static const char *TAG = "OLED";
+
+// ── Dirección I2C del SSD1306 ────────────────────
+#define OLED_ADDR       0x3C
+#define I2C_PORT        I2C_NUM_0
+
+// ── Dimensiones de pantalla ──────────────────────
+#define OLED_WIDTH      128
+#define OLED_HEIGHT     64
+#define OLED_PAGES      8       // 64px / 8px por página
+
+// ── Bytes de control SSD1306 ─────────────────────
+#define OLED_CMD_BYTE   0x00    // el siguiente byte es un comando
+#define OLED_DATA_BYTE  0x40    // el siguiente byte es dato (GDDRAM)
+
+// ════════════════════════════════════════════════
+//  Fuente 5x7 — ASCII 32..127
+// ════════════════════════════════════════════════
+
+/** @brief Tabla de glifos 5x7. Cada carácter ocupa 5 columnas de 8 bits. */
+static const uint8_t font5x7[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, // ' '
+    {0x00,0x00,0x5F,0x00,0x00}, // '!'
+    {0x00,0x07,0x00,0x07,0x00}, // '"'
+    {0x14,0x7F,0x14,0x7F,0x14}, // '#'
+    {0x24,0x2A,0x7F,0x2A,0x12}, // '$'
+    {0x23,0x13,0x08,0x64,0x62}, // '%'
+    {0x36,0x49,0x55,0x22,0x50}, // '&'
+    {0x00,0x05,0x03,0x00,0x00}, // '''
+    {0x00,0x1C,0x22,0x41,0x00}, // '('
+    {0x00,0x41,0x22,0x1C,0x00}, // ')'
+    {0x08,0x2A,0x1C,0x2A,0x08}, // '*'
+    {0x08,0x08,0x3E,0x08,0x08}, // '+'
+    {0x00,0x50,0x30,0x00,0x00}, // ','
+    {0x08,0x08,0x08,0x08,0x08}, // '-'
+    {0x00,0x60,0x60,0x00,0x00}, // '.'
+    {0x20,0x10,0x08,0x04,0x02}, // '/'
+    {0x3E,0x51,0x49,0x45,0x3E}, // '0'
+    {0x00,0x42,0x7F,0x40,0x00}, // '1'
+    {0x42,0x61,0x51,0x49,0x46}, // '2'
+    {0x21,0x41,0x45,0x4B,0x31}, // '3'
+    {0x18,0x14,0x12,0x7F,0x10}, // '4'
+    {0x27,0x45,0x45,0x45,0x39}, // '5'
+    {0x3C,0x4A,0x49,0x49,0x30}, // '6'
+    {0x01,0x71,0x09,0x05,0x03}, // '7'
+    {0x36,0x49,0x49,0x49,0x36}, // '8'
+    {0x06,0x49,0x49,0x29,0x1E}, // '9'
+    {0x00,0x36,0x36,0x00,0x00}, // ':'
+    {0x00,0x56,0x36,0x00,0x00}, // ';'
+    {0x00,0x08,0x14,0x22,0x41}, // '<'
+    {0x14,0x14,0x14,0x14,0x14}, // '='
+    {0x41,0x22,0x14,0x08,0x00}, // '>'
+    {0x02,0x01,0x51,0x09,0x06}, // '?'
+    {0x32,0x49,0x79,0x41,0x3E}, // '@'
+    {0x7E,0x11,0x11,0x11,0x7E}, // 'A'
+    {0x7F,0x49,0x49,0x49,0x36}, // 'B'
+    {0x3E,0x41,0x41,0x41,0x22}, // 'C'
+    {0x7F,0x41,0x41,0x22,0x1C}, // 'D'
+    {0x7F,0x49,0x49,0x49,0x41}, // 'E'
+    {0x7F,0x09,0x09,0x09,0x01}, // 'F'
+    {0x3E,0x41,0x49,0x49,0x7A}, // 'G'
+    {0x7F,0x08,0x08,0x08,0x7F}, // 'H'
+    {0x00,0x41,0x7F,0x41,0x00}, // 'I'
+    {0x20,0x40,0x41,0x3F,0x01}, // 'J'
+    {0x7F,0x08,0x14,0x22,0x41}, // 'K'
+    {0x7F,0x40,0x40,0x40,0x40}, // 'L'
+    {0x7F,0x02,0x04,0x02,0x7F}, // 'M'
+    {0x7F,0x04,0x08,0x10,0x7F}, // 'N'
+    {0x3E,0x41,0x41,0x41,0x3E}, // 'O'
+    {0x7F,0x09,0x09,0x09,0x06}, // 'P'
+    {0x3E,0x41,0x51,0x21,0x5E}, // 'Q'
+    {0x7F,0x09,0x19,0x29,0x46}, // 'R'
+    {0x46,0x49,0x49,0x49,0x31}, // 'S'
+    {0x01,0x01,0x7F,0x01,0x01}, // 'T'
+    {0x3F,0x40,0x40,0x40,0x3F}, // 'U'
+    {0x1F,0x20,0x40,0x20,0x1F}, // 'V'
+    {0x3F,0x40,0x38,0x40,0x3F}, // 'W'
+    {0x63,0x14,0x08,0x14,0x63}, // 'X'
+    {0x07,0x08,0x70,0x08,0x07}, // 'Y'
+    {0x61,0x51,0x49,0x45,0x43}, // 'Z'
+    {0x00,0x7F,0x41,0x41,0x00}, // '['
+    {0x02,0x04,0x08,0x10,0x20}, // '\'
+    {0x00,0x41,0x41,0x7F,0x00}, // ']'
+    {0x04,0x02,0x01,0x02,0x04}, // '^'
+    {0x40,0x40,0x40,0x40,0x40}, // '_'
+    {0x00,0x01,0x02,0x04,0x00}, // '`'
+    {0x20,0x54,0x54,0x54,0x78}, // 'a'
+    {0x7F,0x48,0x44,0x44,0x38}, // 'b'
+    {0x38,0x44,0x44,0x44,0x20}, // 'c'
+    {0x38,0x44,0x44,0x48,0x7F}, // 'd'
+    {0x38,0x54,0x54,0x54,0x18}, // 'e'
+    {0x08,0x7E,0x09,0x01,0x02}, // 'f'
+    {0x08,0x14,0x54,0x54,0x3C}, // 'g'
+    {0x7F,0x08,0x04,0x04,0x78}, // 'h'
+    {0x00,0x44,0x7D,0x40,0x00}, // 'i'
+    {0x20,0x40,0x44,0x3D,0x00}, // 'j'
+    {0x7F,0x10,0x28,0x44,0x00}, // 'k'
+    {0x00,0x41,0x7F,0x40,0x00}, // 'l'
+    {0x7C,0x04,0x18,0x04,0x78}, // 'm'
+    {0x7C,0x08,0x04,0x04,0x78}, // 'n'
+    {0x38,0x44,0x44,0x44,0x38}, // 'o'
+    {0x7C,0x14,0x14,0x14,0x08}, // 'p'
+    {0x08,0x14,0x14,0x18,0x7C}, // 'q'
+    {0x7C,0x08,0x04,0x04,0x08}, // 'r'
+    {0x48,0x54,0x54,0x54,0x20}, // 's'
+    {0x04,0x3F,0x44,0x40,0x20}, // 't'
+    {0x3C,0x40,0x40,0x20,0x7C}, // 'u'
+    {0x1C,0x20,0x40,0x20,0x1C}, // 'v'
+    {0x3C,0x40,0x30,0x40,0x3C}, // 'w'
+    {0x44,0x28,0x10,0x28,0x44}, // 'x'
+    {0x0C,0x50,0x50,0x50,0x3C}, // 'y'
+    {0x44,0x64,0x54,0x4C,0x44}, // 'z'
+    {0x00,0x08,0x36,0x41,0x00}, // '{'
+    {0x00,0x00,0x7F,0x00,0x00}, // '|'
+    {0x00,0x41,0x36,0x08,0x00}, // '}'
+    {0x08,0x08,0x2A,0x1C,0x08}, // '~'
+    {0x08,0x1C,0x2A,0x08,0x08}, // DEL
+};
+
+// ════════════════════════════════════════════════
+//  Funciones internas I2C → SSD1306
+// ════════════════════════════════════════════════
+
+/**
+ * @brief Envía un comando de un byte al controlador SSD1306.
+ *
+ * @param cmd  Byte de comando según el datasheet del SSD1306.
+ */
+static void oled_send_cmd(uint8_t cmd)
+{
+    i2c_cmd_handle_t h = i2c_cmd_link_create();
+    i2c_master_start(h);
+    i2c_master_write_byte(h, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(h, OLED_CMD_BYTE, true);
+    i2c_master_write_byte(h, cmd, true);
+    i2c_master_stop(h);
+    i2c_master_cmd_begin(I2C_PORT, h, pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+    i2c_cmd_link_delete(h);
+}
+
+/**
+ * @brief Envía un bloque de datos (píxeles) al GDDRAM del SSD1306.
+ *
+ * @param data  Puntero al buffer de datos.
+ * @param len   Cantidad de bytes a enviar.
+ */
+static void oled_send_data(const uint8_t *data, size_t len)
+{
+    i2c_cmd_handle_t h = i2c_cmd_link_create();
+    i2c_master_start(h);
+    i2c_master_write_byte(h, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(h, OLED_DATA_BYTE, true);
+    i2c_master_write(h, data, len, true);
+    i2c_master_stop(h);
+    i2c_master_cmd_begin(I2C_PORT, h, pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+    i2c_cmd_link_delete(h);
+}
+
+/**
+ * @brief Posiciona el cursor en la columna y página indicadas.
+ *
+ * @param col   Columna (0–127).
+ * @param page  Página (0–7), cada página tiene 8 píxeles de alto.
+ */
+static void oled_set_cursor(uint8_t col, uint8_t page)
+{
+    oled_send_cmd(0xB0 | (page & 0x07));          // página destino
+    oled_send_cmd(0x00 | (col & 0x0F));           // nibble bajo de columna
+    oled_send_cmd(0x10 | ((col >> 4) & 0x0F));    // nibble alto de columna
+}
+
+// ════════════════════════════════════════════════
+//  API pública
+// ════════════════════════════════════════════════
+
+void oled_init(void)
+{
+    // Secuencia de inicialización estándar del SSD1306
+    const uint8_t init_cmds[] = {
+        0xAE,       // display OFF
+        0xD5, 0x80, // frecuencia de reloj
+        0xA8, 0x3F, // multiplex ratio (64 líneas)
+        0xD3, 0x00, // display offset = 0
+        0x40,       // start line = 0
+        0x8D, 0x14, // charge pump ON
+        0x20, 0x00, // modo de direccionamiento horizontal
+        0xA1,       // seg remap (columna 127 → SEG0)
+        0xC8,       // COM scan dirección inversa
+        0xDA, 0x12, // COM pins config
+        0x81, 0xCF, // contraste
+        0xD9, 0xF1, // pre-charge period
+        0xDB, 0x40, // VCOMH deselect level
+        0xA4,       // display desde RAM
+        0xA6,       // modo normal (no invertido)
+        0xAF,       // display ON
+    };
+
+    for (size_t i = 0; i < sizeof(init_cmds); i++)
+        oled_send_cmd(init_cmds[i]);
+
+    oled_clear();
+    ESP_LOGI(TAG, "OLED SSD1306 lista ✓");
+}
+
+void oled_clear(void)
+{
+    static const uint8_t blank[OLED_WIDTH] = {0};
+    for (uint8_t p = 0; p < OLED_PAGES; p++) {
+        oled_set_cursor(0, p);
+        oled_send_data(blank, OLED_WIDTH);
+    }
+}
+
+/**
+ * @brief Dibuja un carácter ASCII en la posición actual del cursor.
+ *
+ * Cada carácter ocupa 6 columnas (5 de glifo + 1 de espacio).
+ *
+ * @param col   Columna inicial.
+ * @param page  Página de destino.
+ * @param c     Carácter ASCII a dibujar.
+ */
+static void oled_draw_char(uint8_t col, uint8_t page, char c)
+{
+    if (c < 32 || c > 127) c = '?';
+    oled_set_cursor(col, page);
+    oled_send_data(font5x7[c - 32], 5);
+    // espacio entre caracteres
+    uint8_t sp = 0x00;
+    oled_send_data(&sp, 1);
+}
+
+/**
+ * @brief Dibuja una cadena de texto en la pantalla.
+ *
+ * @param col   Columna inicial.
+ * @param page  Página de destino.
+ * @param str   Cadena de texto terminada en '\0'.
+ */
+static void oled_draw_string(uint8_t col, uint8_t page, const char *str)
+{
+    while (*str && col < OLED_WIDTH) {
+        oled_draw_char(col, page, *str++);
+        col += 6; // ancho de carácter + espacio
+    }
+}
+
+void oled_show_data(float ax, float ay, float az,
+                    float gx, float gy, float gz)
+{
+    char buf[22];
+    oled_clear();
+
+    // ── Título ───────────────────────────────────
+    oled_draw_string(0, 0, "-- MPU6050 --");
+
+    // ── Acelerómetro (páginas 1–3) ───────────────
+    snprintf(buf, sizeof(buf), "Ax:%6.3fg", ax);
+    oled_draw_string(0, 1, buf);
+
+    snprintf(buf, sizeof(buf), "Ay:%6.3fg", ay);
+    oled_draw_string(0, 2, buf);
+
+    snprintf(buf, sizeof(buf), "Az:%6.3fg", az);
+    oled_draw_string(0, 3, buf);
+
+    // ── Giroscopio (páginas 4–6) ─────────────────
+    snprintf(buf, sizeof(buf), "Gx:%6.1f/s", gx);
+    oled_draw_string(0, 4, buf);
+
+    snprintf(buf, sizeof(buf), "Gy:%6.1f/s", gy);
+    oled_draw_string(0, 5, buf);
+
+    snprintf(buf, sizeof(buf), "Gz:%6.1f/s", gz);
+    oled_draw_string(0, 6, buf);
+}
+
+void oled_show_gps(double lat, double lon, float alt, float spd)
+{
+    char buf[22];
+    oled_clear();
+
+    oled_draw_string(0, 0, "--- GPS ---");
+
+    snprintf(buf, sizeof(buf), "Lat:%.6f", lat);
+    oled_draw_string(0, 1, buf);
+
+    snprintf(buf, sizeof(buf), "Lon:%.6f", lon);
+    oled_draw_string(0, 2, buf);
+
+    snprintf(buf, sizeof(buf), "Alt:%.1fm", alt);
+    oled_draw_string(0, 3, buf);
+
+    snprintf(buf, sizeof(buf), "Spd:%.1fkm/h", spd);
+    oled_draw_string(0, 4, buf);
+}
